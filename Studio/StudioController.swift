@@ -36,7 +36,7 @@ final class StudioController: UIViewController, WKNavigationDelegate, WKUIDelega
             configuration.websiteDataStore = .default()
             configuration.userContentController.addScriptMessageHandler(self, contentWorld: .page, name: "studio")
             let faceSupported = ARFaceTrackingConfiguration.isSupported ? "true" : "false"
-            configuration.userContentController.addUserScript(WKUserScript(source: "window.__studioNativeFaceAvailable=\(faceSupported);window.__studioShellVersion='1.2.3';", injectionTime: .atDocumentStart, forMainFrameOnly: true))
+            configuration.userContentController.addUserScript(WKUserScript(source: "window.__studioNativeFaceAvailable=\(faceSupported);window.__studioShellVersion='1.2.4';", injectionTime: .atDocumentStart, forMainFrameOnly: true))
             webView = WKWebView(frame: .zero, configuration: configuration)
             webView.translatesAutoresizingMaskIntoConstraints = false
             webView.navigationDelegate = self
@@ -316,3 +316,4 @@ private final class StudioFaceSession: NSObject, ARSessionDelegate {
     func session(_ session: ARSession, didFailWithError error: Error) { active = false; session.pause(); output(["error": error.localizedDescription, "tracking": false]) }
     func sessionWasInterrupted(_ session: ARSession) { output(["tracking": false]) }
 }
+
