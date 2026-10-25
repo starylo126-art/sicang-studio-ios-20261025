@@ -1,0 +1,9 @@
+build/
+dist/
+*.scstudio
+*.ipa
+*.p12
+*.mobileprovision
+*.xcuserstate
+xcuserdata/
+.DS_Store

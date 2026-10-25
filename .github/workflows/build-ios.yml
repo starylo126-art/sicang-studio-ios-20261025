@@ -1,0 +1,19 @@
+name: Build free unsigned iOS app
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  build:
+    # Standard runner. No paid larger runners, credentials, signing or deployment.
+    runs-on: macos-15
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Compile native app without signing
+        run: bash build-unsigned.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: PrivateWardrobe-unsigned-IPA
+          path: dist/PrivateWardrobe-unsigned.ipa
+          retention-days: 1

@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+ <key>CFBundleDisplayName</key><string>私藏动捕室</string>
+ <key>CFBundleIdentifier</key><string>$(PRODUCT_BUNDLE_IDENTIFIER)</string>
+ <key>CFBundleExecutable</key><string>$(EXECUTABLE_NAME)</string>
+ <key>CFBundleName</key><string>$(PRODUCT_NAME)</string>
+ <key>CFBundlePackageType</key><string>APPL</string>
+ <key>CFBundleShortVersionString</key><string>1.0.0</string>
+ <key>CFBundleVersion</key><string>1</string>
+ <key>LSRequiresIPhoneOS</key><true/>
+ <key>NSCameraUsageDescription</key><string>使用前置摄像头在手机本地识别表情，驱动你的衣橱角色。画面不会上传。</string>
+ <key>NSPhotoLibraryAddUsageDescription</key><string>将你主动导出的角色图片或视频保存到相册。</string>
+ <key>NSAppTransportSecurity</key><dict><key>NSAllowsLocalNetworking</key><true/></dict>
+ <key>UILaunchScreen</key><dict/>
+ <key>UIApplicationSceneManifest</key><dict><key>UIApplicationSupportsMultipleScenes</key><false/></dict>
+ <key>UIRequiresFullScreen</key><true/>
+ <key>UIFileSharingEnabled</key><true/>
+ <key>LSSupportsOpeningDocumentsInPlace</key><true/>
+ <key>UISupportedInterfaceOrientations</key><array><string>UIInterfaceOrientationPortrait</string><string>UIInterfaceOrientationLandscapeLeft</string><string>UIInterfaceOrientationLandscapeRight</string></array>
+ <key>UTImportedTypeDeclarations</key><array><dict><key>UTTypeIdentifier</key><string>com.sicang.studio.resources</string><key>UTTypeDescription</key><string>私藏离线衣橱</string><key>UTTypeConformsTo</key><array><string>public.data</string></array><key>UTTypeTagSpecification</key><dict><key>public.filename-extension</key><array><string>scstudio</string></array></dict></dict></array>
+ <key>CFBundleDocumentTypes</key><array><dict><key>CFBundleTypeName</key><string>私藏离线衣橱</string><key>LSHandlerRank</key><string>Alternate</string><key>LSItemContentTypes</key><array><string>com.sicang.studio.resources</string></array></dict></array>
+</dict></plist>
