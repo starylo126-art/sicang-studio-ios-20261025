@@ -36,7 +36,7 @@ final class StudioController: UIViewController, WKNavigationDelegate, WKUIDelega
             configuration.websiteDataStore = .default()
             configuration.userContentController.addScriptMessageHandler(self, contentWorld: .page, name: "studio")
             let faceSupported = ARFaceTrackingConfiguration.isSupported ? "true" : "false"
-            configuration.userContentController.addUserScript(WKUserScript(source: "window.__studioNativeFaceAvailable=\(faceSupported);window.__studioShellVersion='1.2.0';", injectionTime: .atDocumentStart, forMainFrameOnly: true))
+            configuration.userContentController.addUserScript(WKUserScript(source: "window.__studioNativeFaceAvailable=\(faceSupported);window.__studioShellVersion='1.2.1';", injectionTime: .atDocumentStart, forMainFrameOnly: true))
             webView = WKWebView(frame: .zero, configuration: configuration)
             webView.translatesAutoresizingMaskIntoConstraints = false
             webView.navigationDelegate = self
@@ -285,7 +285,28 @@ private final class StudioFaceSession: NSObject, ARSessionDelegate {
         if reference == nil { reference = rotation }
         let delta = simd_inverse(reference!) * rotation
         let matrix: [Float] = [delta.columns.0.x, delta.columns.0.y, delta.columns.0.z, 0, delta.columns.1.x, delta.columns.1.y, delta.columns.1.z, 0, delta.columns.2.x, delta.columns.2.y, delta.columns.2.z, 0, 0, 0, 0, 1]
-        let shapes = Dictionary(uniqueKeysWithValues: face.blendShapes.map { ($0.key.rawValue, $0.value.doubleValue) })
+        // Swift enum spelling is our wire contract. ARKit's rawValue strings
+        // are not that contract (in particular the left/right suffixes).
+        // Read typed keys directly; do not silently turn an unknown key into 0.
+        let channels: [(String, ARFaceAnchor.BlendShapeLocation)] = [
+            ("eyeBlinkLeft", .eyeBlinkLeft), ("eyeBlinkRight", .eyeBlinkRight),
+            ("eyeWideLeft", .eyeWideLeft), ("eyeWideRight", .eyeWideRight),
+            ("jawOpen", .jawOpen), ("mouthClose", .mouthClose),
+            ("mouthSmileLeft", .mouthSmileLeft), ("mouthSmileRight", .mouthSmileRight),
+            ("browInnerUp", .browInnerUp), ("browOuterUpLeft", .browOuterUpLeft),
+            ("browOuterUpRight", .browOuterUpRight), ("browDownLeft", .browDownLeft),
+            ("browDownRight", .browDownRight),
+            ("eyeLookOutLeft", .eyeLookOutLeft), ("eyeLookInLeft", .eyeLookInLeft),
+            ("eyeLookInRight", .eyeLookInRight), ("eyeLookOutRight", .eyeLookOutRight),
+            ("eyeLookDownLeft", .eyeLookDownLeft), ("eyeLookDownRight", .eyeLookDownRight),
+            ("eyeLookUpLeft", .eyeLookUpLeft), ("eyeLookUpRight", .eyeLookUpRight)
+        ]
+        var shapes: [String: Double] = [:]
+        for (name, key) in channels { if let value = face.blendShapes[key] { shapes[name] = value.doubleValue } }
+        guard shapes["eyeBlinkLeft"] != nil, shapes["eyeBlinkRight"] != nil else {
+            output(["tracking": false, "error": "系统未返回眼睑参数，请重新开启摄像头。"])
+            return
+        }
         output(["tracking": true, "matrix": matrix, "blendshapes": shapes, "latency": max(0, (ProcessInfo.processInfo.systemUptime - frame.timestamp) * 1000)])
     }
     func session(_ session: ARSession, didFailWithError error: Error) { active = false; session.pause(); output(["error": error.localizedDescription, "tracking": false]) }
