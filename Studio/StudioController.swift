@@ -279,6 +279,10 @@ private final class StudioFaceSession: NSObject, ARSessionDelegate {
         lastSent = frame.timestamp
         guard let face = frame.anchors.compactMap({ $0 as? ARFaceAnchor }).first, face.isTracked else { output(["tracking": false]); return }
         let relative = simd_inverse(frame.camera.transform) * face.transform
+        let position = SIMD3(face.transform.columns.3.x, face.transform.columns.3.y, face.transform.columns.3.z)
+        let orientation = (UIApplication.shared.connectedScenes.first as? UIWindowScene)?.interfaceOrientation ?? .portrait
+        let center = frame.camera.projectPoint(position, orientation: orientation, viewportSize: CGSize(width: 1, height: 1))
+        let distance = simd_length(SIMD3(relative.columns.3.x, relative.columns.3.y, relative.columns.3.z))
         let rotation = simd_float3x3(columns: (SIMD3(relative.columns.0.x, relative.columns.0.y, relative.columns.0.z), SIMD3(relative.columns.1.x, relative.columns.1.y, relative.columns.1.z), SIMD3(relative.columns.2.x, relative.columns.2.y, relative.columns.2.z)))
         // The first visible face defines device orientation; explicit calibration
         // resets this reference as well, including after the phone is rotated.
@@ -307,7 +311,7 @@ private final class StudioFaceSession: NSObject, ARSessionDelegate {
             output(["tracking": false, "error": "系统未返回眼睑参数，请重新开启摄像头。"])
             return
         }
-        output(["tracking": true, "matrix": matrix, "blendshapes": shapes, "latency": max(0, (ProcessInfo.processInfo.systemUptime - frame.timestamp) * 1000)])
+        output(["tracking": true, "matrix": matrix, "center": [center.x, center.y], "distance": distance, "blendshapes": shapes, "latency": max(0, (ProcessInfo.processInfo.systemUptime - frame.timestamp) * 1000)])
     }
     func session(_ session: ARSession, didFailWithError error: Error) { active = false; session.pause(); output(["error": error.localizedDescription, "tracking": false]) }
     func sessionWasInterrupted(_ session: ARSession) { output(["tracking": false]) }
