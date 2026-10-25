@@ -2,8 +2,11 @@
 
 当前交付状态
 已有原生 Swift 工程、离线资源导入器、手机本地 HTTP 服务、相机权限处理、系统分享导出、免费云编译工作流。
-本次在 Windows 制作，尚未经过 Xcode 编译、签名安装或 iPhone 真机验收。此目录不是 IPA 安装包。
-网页界面和动捕逻辑的本地检查结果见旁边的《界面与iOS验证报告.json》。
+已在 GitHub 标准 macos-15 runner 上通过 Xcode Release 编译，生成 arm64 未签名 IPA。尚未签名安装或进行 iPhone 真机验收。
+已下载的成品：私藏动捕室_iOS_未签名.ipa。首次使用直接从下方第 4 步开始，无需再次编译。
+网页、本地资源及云编译检查结果见旁边的《界面与iOS验证报告.json》。
+构建记录：https://github.com/starylo126-art/sicang-studio-ios-20261025/actions/runs/40169082049
+公开仓库：https://github.com/starylo126-art/sicang-studio-ios-20261025
 
 不买 Mac、不买开发者会员的安装路线
 1. 在自己的 GitHub 账户新建仓库。只上传本目录的内容（包含隐藏的 .github 目录），不要上传旁边的 .scstudio 素材包。
