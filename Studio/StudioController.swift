@@ -13,7 +13,9 @@ final class StudioController: UIViewController, WKNavigationDelegate, WKUIDelega
     private let importButton = UIButton(type: .system)
     private var importing = false
     private var nativeFace: StudioFaceSession?
-    private var deliveringFaceFrame = false
+    private let faceFrameLock = NSLock()
+    private var latestFaceFrame: [String: Any]?
+    private var faceDeliveryScheduled = false
     private struct Export {
         let id: String
         let url: URL
@@ -36,7 +38,7 @@ final class StudioController: UIViewController, WKNavigationDelegate, WKUIDelega
             configuration.websiteDataStore = .default()
             configuration.userContentController.addScriptMessageHandler(self, contentWorld: .page, name: "studio")
             let faceSupported = ARFaceTrackingConfiguration.isSupported ? "true" : "false"
-            configuration.userContentController.addUserScript(WKUserScript(source: "window.__studioNativeFaceAvailable=\(faceSupported);window.__studioShellVersion='1.2.4';", injectionTime: .atDocumentStart, forMainFrameOnly: true))
+            configuration.userContentController.addUserScript(WKUserScript(source: "window.__studioNativeFaceAvailable=\(faceSupported);window.__studioShellVersion='1.2.5';", injectionTime: .atDocumentStart, forMainFrameOnly: true))
             webView = WKWebView(frame: .zero, configuration: configuration)
             webView.translatesAutoresizingMaskIntoConstraints = false
             webView.navigationDelegate = self
@@ -62,6 +64,11 @@ final class StudioController: UIViewController, WKNavigationDelegate, WKUIDelega
                 else { self.status.text = "从「文件」选择电脑生成的 .scstudio 衣橱资源包。导入后无需联网。" }
             }
         } catch { status.text = error.localizedDescription }
+    }
+
+    override func viewDidLayoutSubviews() {
+        super.viewDidLayoutSubviews()
+        nativeFace?.setView(orientation: view.window?.windowScene?.interfaceOrientation ?? .portrait, size: view.bounds.size)
     }
 
     private func buildSetup() {
@@ -172,13 +179,15 @@ final class StudioController: UIViewController, WKNavigationDelegate, WKUIDelega
             case "startFace":
                 nativeFace?.start { result in
                     switch result {
-                    case .success: replyHandler(["ok": true, "delegate": "ARKit"], nil)
+                    case .success(let sessionID): replyHandler(["ok": true, "delegate": "ARKit", "sessionID": sessionID], nil)
                     case .failure(let error): replyHandler(nil, error.localizedDescription)
                     }
                 }
                 return
             case "stopFace": nativeFace?.stop()
-            case "calibrateFace": nativeFace?.calibrate()
+            case "calibrateFace":
+                nativeFace?.calibrate { epoch in replyHandler(["ok": true, "calibrationEpoch": epoch], nil) }
+                return
             case "import": pickResources()
             case "begin":
                 guard export == nil, let id = body["id"] as? String, UUID(uuidString: id) != nil, let rawName = body["name"] as? String, let size = body["size"] as? Int, size > 0, size <= maximumExport else { throw StudioFailure("导出请求无效或已有文件正在保存。") }
@@ -220,11 +229,29 @@ final class StudioController: UIViewController, WKNavigationDelegate, WKUIDelega
     @objc private func pauseNativeFace() { nativeFace?.stop() }
 
     private func deliverFace(_ value: [String: Any]) {
-        // Never queue camera-derived frames behind a busy web view. Only the
-        // latest ARKit parameters cross the bridge; camera images stay native.
-        guard !deliveringFaceFrame, !importing, let data = try? JSONSerialization.data(withJSONObject: value), let json = String(data: data, encoding: .utf8) else { return }
-        deliveringFaceFrame = true
-        webView.evaluateJavaScript("window.dispatchEvent(new CustomEvent('studio-native-face',{detail:\(json)}))") { [weak self] _, _ in self?.deliveringFaceFrame = false }
+        // One mailbox and one WebKit evaluation, regardless of camera rate.
+        // An arriving sample REPLACES the pending sample instead of being lost
+        // or appended behind old poses while the web content process is busy.
+        faceFrameLock.lock()
+        latestFaceFrame = value
+        let schedule = !faceDeliveryScheduled
+        faceDeliveryScheduled = true
+        faceFrameLock.unlock()
+        if schedule { DispatchQueue.main.async { [weak self] in self?.flushFaceFrame() } }
+    }
+
+    private func flushFaceFrame() {
+        faceFrameLock.lock()
+        let value = latestFaceFrame
+        latestFaceFrame = nil
+        if value == nil || importing { faceDeliveryScheduled = false }
+        faceFrameLock.unlock()
+        guard !importing, var value = value else { return }
+        if let capturedAt = value["capturedAtMs"] as? Double {
+            value["latency"] = max(0, Date().timeIntervalSince1970 * 1000 - capturedAt)
+        }
+        guard let data = try? JSONSerialization.data(withJSONObject: value), let json = String(data: data, encoding: .utf8) else { flushFaceFrame(); return }
+        webView.evaluateJavaScript("window.dispatchEvent(new CustomEvent('studio-native-face',{detail:\(json)}))") { [weak self] _, _ in self?.flushFaceFrame() }
     }
 }
 
@@ -232,38 +259,61 @@ final class StudioController: UIViewController, WKNavigationDelegate, WKUIDelega
 /// every time the camera opens. No camera image is sent to JavaScript or a server.
 private final class StudioFaceSession: NSObject, ARSessionDelegate {
     private let session = ARSession()
+    private let trackingQueue = DispatchQueue(label: "studio.face-tracking", qos: .userInteractive)
     private let output: ([String: Any]) -> Void
+    // requestGeneration is main-queue-only; all following tracking state lives
+    // on trackingQueue. UIKit orientation is copied there by setView.
+    private var requestGeneration = 0
     private var active = false
-    private var generation = 0
-    private var lastSent: TimeInterval = 0
+    private var sessionID = 0
+    private var calibrationEpoch = 0
+    private var lastProcessed: TimeInterval = 0
     private var reference: simd_float3x3?
+    private var orientation: UIInterfaceOrientation = .portrait
+    private var viewportSize = CGSize(width: 1, height: 1)
     init(output: @escaping ([String: Any]) -> Void) {
         self.output = output
         super.init()
         session.delegate = self
-        session.delegateQueue = .main
+        session.delegateQueue = trackingQueue
     }
-    func start(completion: @escaping (Result<Void, Error>) -> Void) {
+    func setView(orientation: UIInterfaceOrientation, size: CGSize) {
+        guard size.width > 0, size.height > 0 else { return }
+        trackingQueue.async { [weak self] in
+            guard let self = self else { return }
+            if self.orientation != orientation { self.reference = nil; self.calibrationEpoch += 1 }
+            self.orientation = orientation
+            self.viewportSize = size
+        }
+    }
+    func start(completion: @escaping (Result<Int, Error>) -> Void) {
         guard ARFaceTrackingConfiguration.isSupported else { completion(.failure(StudioFailure("此设备不支持系统人脸追踪。"))); return }
-        generation += 1
-        let request = generation
+        requestGeneration += 1
+        let request = requestGeneration
         let begin: (Bool) -> Void = { [weak self] granted in
             DispatchQueue.main.async {
-                guard let self = self, request == self.generation else { completion(.failure(StudioFailure("相机启动已取消。"))); return }
+                guard let self = self, request == self.requestGeneration else { completion(.failure(StudioFailure("相机启动已取消。"))); return }
                 guard granted else { completion(.failure(StudioFailure("请在设置中允许私藏动捕室使用摄像头。"))); return }
                 let config = ARFaceTrackingConfiguration()
                 config.maximumNumberOfTrackedFaces = 1
                 config.isLightEstimationEnabled = false
-                if let format = ARFaceTrackingConfiguration.supportedVideoFormats.filter({ $0.framesPerSecond >= 30 }).min(by: { a, b in
+                let formats = ARFaceTrackingConfiguration.supportedVideoFormats
+                let realTime = formats.filter { $0.framesPerSecond >= 60 }
+                if let format = (realTime.isEmpty ? formats : realTime).min(by: { a, b in
                     let ap = a.imageResolution.width * a.imageResolution.height
                     let bp = b.imageResolution.width * b.imageResolution.height
-                    return ap == bp ? a.framesPerSecond < b.framesPerSecond : ap < bp
+                    if realTime.isEmpty { return a.framesPerSecond == b.framesPerSecond ? ap < bp : a.framesPerSecond > b.framesPerSecond }
+                    return a.framesPerSecond == b.framesPerSecond ? ap < bp : a.framesPerSecond < b.framesPerSecond
                 }) { config.videoFormat = format }
-                self.reference = nil
-                self.lastSent = 0
-                self.active = true
-                self.session.run(config, options: [.resetTracking, .removeExistingAnchors])
-                completion(.success(()))
+                self.trackingQueue.async {
+                    self.reference = nil
+                    self.calibrationEpoch += 1
+                    self.lastProcessed = 0
+                    self.sessionID = request
+                    self.active = true
+                    self.session.run(config, options: [.resetTracking, .removeExistingAnchors])
+                    DispatchQueue.main.async { completion(.success(request)) }
+                }
             }
         }
         switch AVCaptureDevice.authorizationStatus(for: .video) {
@@ -272,22 +322,50 @@ private final class StudioFaceSession: NSObject, ARSessionDelegate {
         default: begin(false)
         }
     }
-    func stop() { generation += 1; active = false; reference = nil; session.pause() }
-    func calibrate() { reference = nil }
-    func session(_ session: ARSession, didUpdate frame: ARFrame) {
-        guard active, frame.timestamp - lastSent >= 1.0 / 30.0 else { return }
-        lastSent = frame.timestamp
-        guard let face = frame.anchors.compactMap({ $0 as? ARFaceAnchor }).first, face.isTracked else { output(["tracking": false]); return }
-        let relative = simd_inverse(frame.camera.transform) * face.transform
+    func stop() {
+        requestGeneration += 1
+        trackingQueue.async { self.active = false; self.reference = nil; self.session.pause() }
+    }
+    func calibrate(completion: @escaping (Int) -> Void) {
+        trackingQueue.async {
+            self.reference = nil
+            self.calibrationEpoch += 1
+            let epoch = self.calibrationEpoch
+            DispatchQueue.main.async { completion(epoch) }
+        }
+    }
+    private func emit(_ value: [String: Any], timestamp: TimeInterval? = nil) {
+        var packet = value
+        packet["sessionID"] = sessionID
+        packet["calibrationEpoch"] = calibrationEpoch
+        if let timestamp = timestamp {
+            packet["timestamp"] = timestamp * 1000
+            let latency = max(0, (ProcessInfo.processInfo.systemUptime - timestamp) * 1000)
+            packet["latency"] = latency
+            packet["capturedAtMs"] = Date().timeIntervalSince1970 * 1000 - latency
+        }
+        output(packet)
+    }
+    func session(_ session: ARSession, didUpdate incomingFrame: ARFrame) {
+        // If a callback waited behind other work, use ARKit's newest complete
+        // frame instead of replaying the queued historical camera samples.
+        let frame = session.currentFrame ?? incomingFrame
+        guard active, frame.timestamp > lastProcessed else { return }
+        lastProcessed = frame.timestamp
+        guard let face = frame.anchors.compactMap({ $0 as? ARFaceAnchor }).first, face.isTracked else { emit(["tracking": false], timestamp: frame.timestamp); return }
+        let relative = frame.camera.viewMatrix(for: orientation) * face.transform
         let position = SIMD3(face.transform.columns.3.x, face.transform.columns.3.y, face.transform.columns.3.z)
-        let orientation = (UIApplication.shared.connectedScenes.first as? UIWindowScene)?.interfaceOrientation ?? .portrait
-        let center = frame.camera.projectPoint(position, orientation: orientation, viewportSize: CGSize(width: 1, height: 1))
+        let projected = frame.camera.projectPoint(position, orientation: orientation, viewportSize: viewportSize)
+        let center = CGPoint(x: projected.x / viewportSize.width, y: projected.y / viewportSize.height)
         let distance = simd_length(SIMD3(relative.columns.3.x, relative.columns.3.y, relative.columns.3.z))
         let rotation = simd_float3x3(columns: (SIMD3(relative.columns.0.x, relative.columns.0.y, relative.columns.0.z), SIMD3(relative.columns.1.x, relative.columns.1.y, relative.columns.1.z), SIMD3(relative.columns.2.x, relative.columns.2.y, relative.columns.2.z)))
-        // The first visible face defines device orientation; explicit calibration
-        // resets this reference as well, including after the phone is rotated.
+        // ARKit face axes: viewer-right X, up Y, outward Z. Use display-camera
+        // axes, not sensor axes or the initial face's local axes. For a camera-
+        // space change D, R = D * R0, so R * transpose(R0) recovers D. The old
+        // transpose(R0) * R conjugated D (and could reverse yaw/roll). Mirroring
+        // is intentionally applied once by the JS display option.
         if reference == nil { reference = rotation }
-        let delta = simd_inverse(reference!) * rotation
+        let delta = rotation * simd_transpose(reference!)
         let matrix: [Float] = [delta.columns.0.x, delta.columns.0.y, delta.columns.0.z, 0, delta.columns.1.x, delta.columns.1.y, delta.columns.1.z, 0, delta.columns.2.x, delta.columns.2.y, delta.columns.2.z, 0, 0, 0, 0, 1]
         // Swift enum spelling is our wire contract. ARKit's rawValue strings
         // are not that contract (in particular the left/right suffixes).
@@ -308,12 +386,12 @@ private final class StudioFaceSession: NSObject, ARSessionDelegate {
         var shapes: [String: Double] = [:]
         for (name, key) in channels { if let value = face.blendShapes[key] { shapes[name] = value.doubleValue } }
         guard shapes["eyeBlinkLeft"] != nil, shapes["eyeBlinkRight"] != nil else {
-            output(["tracking": false, "error": "系统未返回眼睑参数，请重新开启摄像头。"])
+            emit(["tracking": false, "error": "系统未返回眼睑参数，请重新开启摄像头。"], timestamp: frame.timestamp)
             return
         }
-        output(["tracking": true, "matrix": matrix, "center": [center.x, center.y], "distance": distance, "blendshapes": shapes, "latency": max(0, (ProcessInfo.processInfo.systemUptime - frame.timestamp) * 1000)])
+        emit(["tracking": true, "coordinateSpace": "display-camera", "matrix": matrix, "center": [center.x, center.y], "distance": distance, "blendshapes": shapes], timestamp: frame.timestamp)
     }
-    func session(_ session: ARSession, didFailWithError error: Error) { active = false; session.pause(); output(["error": error.localizedDescription, "tracking": false]) }
-    func sessionWasInterrupted(_ session: ARSession) { output(["tracking": false]) }
+    func session(_ session: ARSession, didFailWithError error: Error) { active = false; session.pause(); emit(["error": error.localizedDescription, "tracking": false]) }
+    func sessionWasInterrupted(_ session: ARSession) { emit(["tracking": false]) }
 }
 
