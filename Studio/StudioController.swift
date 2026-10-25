@@ -47,7 +47,9 @@ final class StudioController: UIViewController, WKNavigationDelegate, WKUIDelega
                 if let error = error { self.status.text = "本地服务启动失败：\(error.localizedDescription)。请关闭 App 后重试。"; return }
                 self.importButton.isEnabled = true
                 if self.store.root != nil { self.loadStudio() }
-                else { self.status.text = "从「文件」选择电脑生成的 .scstudio 衣橱资源包。导入后无需联网。" }
+                else if let bundled = Bundle.main.url(forResource: "StarterResources", withExtension: "scstudio") {
+                    self.importResources(bundled)
+                } else { self.status.text = "从「文件」选择电脑生成的 .scstudio 衣橱资源包。导入后无需联网。" }
             }
         } catch { status.text = error.localizedDescription }
     }
@@ -97,6 +99,11 @@ final class StudioController: UIViewController, WKNavigationDelegate, WKUIDelega
 
     func documentPicker(_ controller: UIDocumentPickerViewController, didPickDocumentsAt urls: [URL]) {
         guard let url = urls.first, !importing else { return }
+        importResources(url)
+    }
+
+    private func importResources(_ url: URL) {
+        guard !importing else { return }
         importing = true
         importButton.isEnabled = false
         // Stop camera and rendering before replacing resources.
