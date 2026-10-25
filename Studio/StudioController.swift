@@ -1,6 +1,8 @@
 import UIKit
 import WebKit
 import UniformTypeIdentifiers
+import ARKit
+import AVFoundation
 
 final class StudioController: UIViewController, WKNavigationDelegate, WKUIDelegate, WKScriptMessageHandlerWithReply, UIDocumentPickerDelegate {
     private var store: ResourceStore!
@@ -10,6 +12,8 @@ final class StudioController: UIViewController, WKNavigationDelegate, WKUIDelega
     private let status = UILabel()
     private let importButton = UIButton(type: .system)
     private var importing = false
+    private var nativeFace: StudioFaceSession?
+    private var deliveringFaceFrame = false
     private struct Export {
         let id: String
         let url: URL
@@ -31,6 +35,8 @@ final class StudioController: UIViewController, WKNavigationDelegate, WKUIDelega
             configuration.mediaTypesRequiringUserActionForPlayback = []
             configuration.websiteDataStore = .default()
             configuration.userContentController.addScriptMessageHandler(self, contentWorld: .page, name: "studio")
+            let faceSupported = ARFaceTrackingConfiguration.isSupported ? "true" : "false"
+            configuration.userContentController.addUserScript(WKUserScript(source: "window.__studioNativeFaceAvailable=\(faceSupported);window.__studioShellVersion='1.2.0';", injectionTime: .atDocumentStart, forMainFrameOnly: true))
             webView = WKWebView(frame: .zero, configuration: configuration)
             webView.translatesAutoresizingMaskIntoConstraints = false
             webView.navigationDelegate = self
@@ -39,6 +45,8 @@ final class StudioController: UIViewController, WKNavigationDelegate, WKUIDelega
             webView.backgroundColor = view.backgroundColor
             webView.scrollView.bounces = false
             webView.scrollView.contentInsetAdjustmentBehavior = .never
+            nativeFace = StudioFaceSession { [weak self] value in self?.deliverFace(value) }
+            NotificationCenter.default.addObserver(self, selector: #selector(pauseNativeFace), name: UIApplication.didEnterBackgroundNotification, object: nil)
             view.insertSubview(webView, belowSubview: setup)
             NSLayoutConstraint.activate([webView.topAnchor.constraint(equalTo: view.topAnchor), webView.bottomAnchor.constraint(equalTo: view.bottomAnchor), webView.leadingAnchor.constraint(equalTo: view.leadingAnchor), webView.trailingAnchor.constraint(equalTo: view.trailingAnchor)])
             server = LoopbackServer(store: store)
@@ -46,10 +54,12 @@ final class StudioController: UIViewController, WKNavigationDelegate, WKUIDelega
                 guard let self = self else { return }
                 if let error = error { self.status.text = "本地服务启动失败：\(error.localizedDescription)。请关闭 App 后重试。"; return }
                 self.importButton.isEnabled = true
-                if self.store.root != nil { self.loadStudio() }
-                else if let bundled = Bundle.main.url(forResource: "StarterResources", withExtension: "scstudio") {
+                let build = Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? ""
+                let update = UserDefaults.standard.string(forKey: "bundledResourceBuild") != build
+                if let bundled = Bundle.main.url(forResource: "StarterResources", withExtension: "scstudio"), self.store.root == nil || update {
                     self.importResources(bundled)
-                } else { self.status.text = "从「文件」选择电脑生成的 .scstudio 衣橱资源包。导入后无需联网。" }
+                } else if self.store.root != nil { self.loadStudio() }
+                else { self.status.text = "从「文件」选择电脑生成的 .scstudio 衣橱资源包。导入后无需联网。" }
             }
         } catch { status.text = error.localizedDescription }
     }
@@ -105,6 +115,7 @@ final class StudioController: UIViewController, WKNavigationDelegate, WKUIDelega
     private func importResources(_ url: URL) {
         guard !importing else { return }
         importing = true
+        nativeFace?.stop()
         importButton.isEnabled = false
         // Stop camera and rendering before replacing resources.
         webView.loadHTMLString("", baseURL: nil)
@@ -118,7 +129,9 @@ final class StudioController: UIViewController, WKNavigationDelegate, WKUIDelega
                 self.importing = false
                 self.importButton.isEnabled = true
                 switch result {
-                case .success: self.loadStudio()
+                case .success:
+                    UserDefaults.standard.set(Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String, forKey: "bundledResourceBuild")
+                    self.loadStudio()
                 case .failure(let error):
                     self.status.text = error.localizedDescription
                     if self.store.root != nil { self.loadStudio(); self.alert(error.localizedDescription) }
@@ -147,6 +160,7 @@ final class StudioController: UIViewController, WKNavigationDelegate, WKUIDelega
     }
 
     func webViewWebContentProcessDidTerminate(_ webView: WKWebView) {
+        nativeFace?.stop()
         loadStudio()
         alert("系统回收了画面进程，已重新打开衣橱。请重新开启摄像头；未完成的录制可能无法恢复。")
     }
@@ -155,6 +169,16 @@ final class StudioController: UIViewController, WKNavigationDelegate, WKUIDelega
         guard message.frameInfo.isMainFrame, local(message.frameInfo.securityOrigin), let body = message.body as? [String: Any], let action = body["action"] as? String else { replyHandler(nil, "来源不允许"); return }
         do {
             switch action {
+            case "startFace":
+                nativeFace?.start { result in
+                    switch result {
+                    case .success: replyHandler(["ok": true, "delegate": "ARKit"], nil)
+                    case .failure(let error): replyHandler(nil, error.localizedDescription)
+                    }
+                }
+                return
+            case "stopFace": nativeFace?.stop()
+            case "calibrateFace": nativeFace?.calibrate()
             case "import": pickResources()
             case "begin":
                 guard export == nil, let id = body["id"] as? String, UUID(uuidString: id) != nil, let rawName = body["name"] as? String, let size = body["size"] as? Int, size > 0, size <= maximumExport else { throw StudioFailure("导出请求无效或已有文件正在保存。") }
@@ -192,4 +216,78 @@ final class StudioController: UIViewController, WKNavigationDelegate, WKUIDelega
         alert.addAction(UIAlertAction(title: "好", style: .default))
         present(alert, animated: true)
     }
+
+    @objc private func pauseNativeFace() { nativeFace?.stop() }
+
+    private func deliverFace(_ value: [String: Any]) {
+        // Never queue camera-derived frames behind a busy web view. Only the
+        // latest ARKit parameters cross the bridge; camera images stay native.
+        guard !deliveringFaceFrame, !importing, let data = try? JSONSerialization.data(withJSONObject: value), let json = String(data: data, encoding: .utf8) else { return }
+        deliveringFaceFrame = true
+        webView.evaluateJavaScript("window.dispatchEvent(new CustomEvent('studio-native-face',{detail:\(json)}))") { [weak self] _, _ in self?.deliveringFaceFrame = false }
+    }
+}
+
+/// Uses the system's face tracker instead of compiling a web inference engine
+/// every time the camera opens. No camera image is sent to JavaScript or a server.
+private final class StudioFaceSession: NSObject, ARSessionDelegate {
+    private let session = ARSession()
+    private let output: ([String: Any]) -> Void
+    private var active = false
+    private var generation = 0
+    private var lastSent: TimeInterval = 0
+    private var reference: simd_float3x3?
+    init(output: @escaping ([String: Any]) -> Void) {
+        self.output = output
+        super.init()
+        session.delegate = self
+        session.delegateQueue = .main
+    }
+    func start(completion: @escaping (Result<Void, Error>) -> Void) {
+        guard ARFaceTrackingConfiguration.isSupported else { completion(.failure(StudioFailure("此设备不支持系统人脸追踪。"))); return }
+        generation += 1
+        let request = generation
+        let begin: (Bool) -> Void = { [weak self] granted in
+            DispatchQueue.main.async {
+                guard let self = self, request == self.generation else { completion(.failure(StudioFailure("相机启动已取消。"))); return }
+                guard granted else { completion(.failure(StudioFailure("请在设置中允许私藏动捕室使用摄像头。"))); return }
+                let config = ARFaceTrackingConfiguration()
+                config.maximumNumberOfTrackedFaces = 1
+                config.isLightEstimationEnabled = false
+                if let format = ARFaceTrackingConfiguration.supportedVideoFormats.filter({ $0.framesPerSecond >= 30 }).min(by: { a, b in
+                    let ap = a.imageResolution.width * a.imageResolution.height
+                    let bp = b.imageResolution.width * b.imageResolution.height
+                    return ap == bp ? a.framesPerSecond < b.framesPerSecond : ap < bp
+                }) { config.videoFormat = format }
+                self.reference = nil
+                self.lastSent = 0
+                self.active = true
+                self.session.run(config, options: [.resetTracking, .removeExistingAnchors])
+                completion(.success(()))
+            }
+        }
+        switch AVCaptureDevice.authorizationStatus(for: .video) {
+        case .authorized: begin(true)
+        case .notDetermined: AVCaptureDevice.requestAccess(for: .video, completionHandler: begin)
+        default: begin(false)
+        }
+    }
+    func stop() { generation += 1; active = false; reference = nil; session.pause() }
+    func calibrate() { reference = nil }
+    func session(_ session: ARSession, didUpdate frame: ARFrame) {
+        guard active, frame.timestamp - lastSent >= 1.0 / 30.0 else { return }
+        lastSent = frame.timestamp
+        guard let face = frame.anchors.compactMap({ $0 as? ARFaceAnchor }).first, face.isTracked else { output(["tracking": false]); return }
+        let relative = simd_inverse(frame.camera.transform) * face.transform
+        let rotation = simd_float3x3(columns: (SIMD3(relative.columns.0.x, relative.columns.0.y, relative.columns.0.z), SIMD3(relative.columns.1.x, relative.columns.1.y, relative.columns.1.z), SIMD3(relative.columns.2.x, relative.columns.2.y, relative.columns.2.z)))
+        // The first visible face defines device orientation; explicit calibration
+        // resets this reference as well, including after the phone is rotated.
+        if reference == nil { reference = rotation }
+        let delta = simd_inverse(reference!) * rotation
+        let matrix: [Float] = [delta.columns.0.x, delta.columns.0.y, delta.columns.0.z, 0, delta.columns.1.x, delta.columns.1.y, delta.columns.1.z, 0, delta.columns.2.x, delta.columns.2.y, delta.columns.2.z, 0, 0, 0, 0, 1]
+        let shapes = Dictionary(uniqueKeysWithValues: face.blendShapes.map { ($0.key.rawValue, $0.value.doubleValue) })
+        output(["tracking": true, "matrix": matrix, "blendshapes": shapes, "latency": max(0, (ProcessInfo.processInfo.systemUptime - frame.timestamp) * 1000)])
+    }
+    func session(_ session: ARSession, didFailWithError error: Error) { active = false; session.pause(); output(["error": error.localizedDescription, "tracking": false]) }
+    func sessionWasInterrupted(_ session: ARSession) { output(["tracking": false]) }
 }
