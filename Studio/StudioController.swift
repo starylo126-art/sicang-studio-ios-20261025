@@ -38,7 +38,7 @@ final class StudioController: UIViewController, WKNavigationDelegate, WKUIDelega
             configuration.websiteDataStore = .default()
             configuration.userContentController.addScriptMessageHandler(self, contentWorld: .page, name: "studio")
             let faceSupported = ARFaceTrackingConfiguration.isSupported ? "true" : "false"
-            configuration.userContentController.addUserScript(WKUserScript(source: "window.__studioNativeFaceAvailable=\(faceSupported);window.__studioShellVersion='1.2.5';", injectionTime: .atDocumentStart, forMainFrameOnly: true))
+            configuration.userContentController.addUserScript(WKUserScript(source: "window.__studioNativeFaceAvailable=\(faceSupported);window.__studioShellVersion='1.2.6';", injectionTime: .atDocumentStart, forMainFrameOnly: true))
             webView = WKWebView(frame: .zero, configuration: configuration)
             webView.translatesAutoresizingMaskIntoConstraints = false
             webView.navigationDelegate = self
@@ -269,6 +269,8 @@ private final class StudioFaceSession: NSObject, ARSessionDelegate {
     private var calibrationEpoch = 0
     private var lastProcessed: TimeInterval = 0
     private var reference: simd_float3x3?
+    private var imageBasis: SIMD3<Float>?
+    private var sourceMirrored: Bool?
     private var orientation: UIInterfaceOrientation = .portrait
     private var viewportSize = CGSize(width: 1, height: 1)
     init(output: @escaping ([String: Any]) -> Void) {
@@ -281,7 +283,12 @@ private final class StudioFaceSession: NSObject, ARSessionDelegate {
         guard size.width > 0, size.height > 0 else { return }
         trackingQueue.async { [weak self] in
             guard let self = self else { return }
-            if self.orientation != orientation { self.reference = nil; self.calibrationEpoch += 1 }
+            if self.orientation != orientation {
+                self.reference = nil
+                self.imageBasis = nil
+                self.sourceMirrored = nil
+                self.calibrationEpoch += 1
+            }
             self.orientation = orientation
             self.viewportSize = size
         }
@@ -307,6 +314,8 @@ private final class StudioFaceSession: NSObject, ARSessionDelegate {
                 }) { config.videoFormat = format }
                 self.trackingQueue.async {
                     self.reference = nil
+                    self.imageBasis = nil
+                    self.sourceMirrored = nil
                     self.calibrationEpoch += 1
                     self.lastProcessed = 0
                     self.sessionID = request
@@ -353,17 +362,55 @@ private final class StudioFaceSession: NSObject, ARSessionDelegate {
         guard active, frame.timestamp > lastProcessed else { return }
         lastProcessed = frame.timestamp
         guard let face = frame.anchors.compactMap({ $0 as? ARFaceAnchor }).first, face.isTracked else { emit(["tracking": false], timestamp: frame.timestamp); return }
-        let relative = frame.camera.viewMatrix(for: orientation) * face.transform
+        let viewMatrix = frame.camera.viewMatrix(for: orientation)
+        let relative = viewMatrix * face.transform
         let position = SIMD3(face.transform.columns.3.x, face.transform.columns.3.y, face.transform.columns.3.z)
         let projected = frame.camera.projectPoint(position, orientation: orientation, viewportSize: viewportSize)
         let center = CGPoint(x: projected.x / viewportSize.width, y: projected.y / viewportSize.height)
         let distance = simd_length(SIMD3(relative.columns.3.x, relative.columns.3.y, relative.columns.3.z))
-        let rotation = simd_float3x3(columns: (SIMD3(relative.columns.0.x, relative.columns.0.y, relative.columns.0.z), SIMD3(relative.columns.1.x, relative.columns.1.y, relative.columns.1.z), SIMD3(relative.columns.2.x, relative.columns.2.y, relative.columns.2.z)))
-        // ARKit face axes: viewer-right X, up Y, outward Z. Use display-camera
-        // axes, not sensor axes or the initial face's local axes. For a camera-
-        // space change D, R = D * R0, so R * transpose(R0) recovers D. The old
-        // transpose(R0) * R conjugated D (and could reverse yaw/roll). Mirroring
-        // is intentionally applied once by the JS display option.
+        let viewRotation = simd_float3x3(columns: (SIMD3(relative.columns.0.x, relative.columns.0.y, relative.columns.0.z), SIMD3(relative.columns.1.x, relative.columns.1.y, relative.columns.1.z), SIMD3(relative.columns.2.x, relative.columns.2.y, relative.columns.2.z)))
+        func project(_ world: SIMD4<Float>) -> CGPoint {
+            frame.camera.projectPoint(SIMD3(world.x, world.y, world.z), orientation: orientation, viewportSize: viewportSize)
+        }
+        let leftEye = project(face.transform * face.leftEyeTransform.columns.3)
+        let rightEye = project(face.transform * face.rightEyeTransform.columns.3)
+        let forward = project(face.transform * SIMD4<Float>(0, 0, 0.04, 1))
+        let up = project(face.transform * SIMD4<Float>(0, 0.04, 0, 1))
+        if imageBasis == nil || sourceMirrored == nil {
+            // ARKit's VIEW presentation may be reflected, whereas raw matrices
+            // and anatomical blendshape names are different contracts. Measure
+            // the actual projectPoint mapping instead of guessing a sign from
+            // the fact that a front-facing camera is in use.
+            let cameraToWorld = simd_inverse(viewMatrix)
+            let origin = SIMD4<Float>(position.x, position.y, position.z, 1)
+            let positiveX = project(origin + cameraToWorld.columns.0 * 0.01)
+            let positiveY = project(origin + cameraToWorld.columns.1 * 0.01)
+            let xDerivative = positiveX.x - projected.x
+            let yDerivative = positiveY.y - projected.y
+            let eye = CGPoint(x: leftEye.x - rightEye.x, y: leftEye.y - rightEye.y)
+            let top = CGPoint(x: up.x - projected.x, y: up.y - projected.y)
+            let eyeLength = hypot(eye.x, eye.y), topLength = hypot(top.x, top.y)
+            // The anatomical-left eye axis and the face-up axis also work for
+            // a tilted neutral pose. X ordering alone would reverse at 90° roll.
+            let parity = (eye.x * top.y - eye.y * top.x) / max(0.001, eyeLength * topLength)
+            guard abs(viewRotation.columns.2.z) > 0.7,
+                  eyeLength > max(2, viewportSize.width * 0.005), topLength > 2,
+                  abs(parity) > 0.6, abs(xDerivative) > 0.01, abs(yDerivative) > 0.01 else {
+                emit(["tracking": false], timestamp: frame.timestamp)
+                return
+            }
+            // Image basis: +X projects right, +Y projects up, +Z points from
+            // the face toward the camera. A reflected image is allowed here;
+            // JS normalizes its horizontal channels before the user option.
+            imageBasis = SIMD3<Float>(xDerivative > 0 ? 1 : -1, yDerivative < 0 ? 1 : -1, relative.columns.3.z < 0 ? 1 : -1)
+            sourceMirrored = parity > 0
+        }
+        let basis = simd_float3x3(diagonal: imageBasis!)
+        let rotation = basis * viewRotation
+        // Both R and R0 now use the observed camera-image axes. Their delta
+        // keeps camera-image yaw/roll even if the source has a reflection.
+        // Source parity is fixed for this orientation epoch; occlusion, large
+        // turns, explicit calibration and brief face loss cannot flip it.
         if reference == nil { reference = rotation }
         let delta = rotation * simd_transpose(reference!)
         let matrix: [Float] = [delta.columns.0.x, delta.columns.0.y, delta.columns.0.z, 0, delta.columns.1.x, delta.columns.1.y, delta.columns.1.z, 0, delta.columns.2.x, delta.columns.2.y, delta.columns.2.z, 0, 0, 0, 0, 1]
@@ -389,7 +436,8 @@ private final class StudioFaceSession: NSObject, ARSessionDelegate {
             emit(["tracking": false, "error": "系统未返回眼睑参数，请重新开启摄像头。"], timestamp: frame.timestamp)
             return
         }
-        emit(["tracking": true, "coordinateSpace": "display-camera", "matrix": matrix, "center": [center.x, center.y], "distance": distance, "blendshapes": shapes], timestamp: frame.timestamp)
+        emit(["tracking": true, "coordinateSpace": "camera-image", "sourceMirrored": sourceMirrored!, "matrix": matrix, "center": [center.x, center.y], "distance": distance, "blendshapes": shapes,
+              "directionBasis": ["viewSigns": [imageBasis!.x, imageBasis!.y, imageBasis!.z], "leftEyeX": leftEye.x / viewportSize.width, "rightEyeX": rightEye.x / viewportSize.width, "forwardX": (forward.x - projected.x) / viewportSize.width, "forwardY": (forward.y - projected.y) / viewportSize.height, "upX": (up.x - projected.x) / viewportSize.width, "upY": (up.y - projected.y) / viewportSize.height]], timestamp: frame.timestamp)
     }
     func session(_ session: ARSession, didFailWithError error: Error) { active = false; session.pause(); emit(["error": error.localizedDescription, "tracking": false]) }
     func sessionWasInterrupted(_ session: ARSession) { emit(["tracking": false]) }
